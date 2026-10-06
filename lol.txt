@@ -1,0 +1,782 @@
+#requires -Version 5.1
+
+<#
+===============================================================================
+ THARAK / SYSADMIN WINDOWS INCIDENT RESPONSE COLLECTOR
+===============================================================================
+
+ PURPOSE
+ -------
+ Read-only forensic collection and correlation for a suspected Windows
+ compromise involving:
+
+   - AD credentials: tharak / sysadmin
+   - Lateral movement
+   - Privileged execution
+   - Persistence
+   - Scheduled tasks
+   - Services
+   - Registry modification
+   - PowerShell
+   - WMI persistence
+   - Network/share activity
+   - BitLocker activation
+   - D: volume activity
+
+ DEFAULT INCIDENT WINDOW
+ -----------------------
+ 04-Oct-2026 03:00 IST -> 04-Oct-2026 11:00 IST
+
+ MODES
+ -----
+ Local case:
+
+   .\IR.ps1
+
+ Export case to share:
+
+   .\IR.ps1 -Export "\\server\share\IR"
+
+ Optional:
+
+   .\IR.ps1 -Export "\\server\share\IR" -HashFiles
+
+ IMPORTANT
+ ---------
+ This script is READ ONLY.
+
+ It does NOT:
+   - kill processes
+   - disable accounts
+   - delete persistence
+   - clear event logs
+   - change registry
+   - enable/disable BitLocker
+   - modify firewall
+   - alter security policy
+
+ LIMITATIONS
+ -----------
+ Exact process command lines require command-line auditing / 4688 command
+ line collection to have been enabled.
+
+ Registry modification events require appropriate object auditing.
+
+ Historical network connections cannot be reconstructed from live
+ Get-NetTCPConnection output if they were not logged elsewhere.
+
+ For strongest enterprise-wide attribution, collect the same time window
+ from Domain Controllers as well.
+
+===============================================================================
+#>
+
+[CmdletBinding()]
+param(
+    [string]$Export = "",
+
+    [string]$OutputRoot = "C:\IR_Tharak",
+
+    [string]$SuspectUser = "tharak",
+
+    [string[]]$PivotUsers = @(
+        "tharak",
+        "sysadmin"
+    ),
+
+    # Exact incident window.
+    [string]$StartIST = "2026-10-04T03:00:00+05:30",
+
+    [string]$EndIST = "2026-10-04T11:00:00+05:30",
+
+    [switch]$HashFiles,
+
+    [switch]$IncludeAllSecurityEvents
+)
+
+# ============================================================================
+# GLOBAL SAFETY / COMPATIBILITY
+# ============================================================================
+
+$ErrorActionPreference = "SilentlyContinue"
+
+# DO NOT use $PID as a custom variable.
+# PowerShell already owns the automatic read-only $PID variable.
+
+$HostName = $env:COMPUTERNAME
+$RunTime = Get-Date
+
+# ============================================================================
+# TIME WINDOW
+# ============================================================================
+
+try {
+    $StartOffset = [DateTimeOffset]::Parse($StartIST)
+    $EndOffset   = [DateTimeOffset]::Parse($EndIST)
+
+    # Windows event APIs generally work with local DateTime.
+    $StartTime = $StartOffset.LocalDateTime
+    $EndTime   = $EndOffset.LocalDateTime
+}
+catch {
+    $StartTime = [datetime]"2026-10-04 03:00:00"
+    $EndTime   = [datetime]"2026-10-04 11:00:00"
+}
+
+# ============================================================================
+# CASE DIRECTORY
+# ============================================================================
+
+$Stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+
+$CaseRoot = Join-Path `
+    $OutputRoot `
+    "${HostName}_${Stamp}"
+
+New-Item `
+    -ItemType Directory `
+    -Path $CaseRoot `
+    -Force |
+    Out-Null
+
+# ============================================================================
+# FILES
+# ============================================================================
+
+$LogFile       = Join-Path $CaseRoot "IR.log"
+$HitFile       = Join-Path $CaseRoot "SUSPICIOUS_FINDINGS.csv"
+$TimelineFile  = Join-Path $CaseRoot "MASTER_TIMELINE.csv"
+$ErrorFile     = Join-Path $CaseRoot "COLLECTOR_ERRORS.csv"
+$SummaryFile   = Join-Path $CaseRoot "SUMMARY.txt"
+
+# ============================================================================
+# COLLECTION ARRAYS
+# ============================================================================
+
+$Findings = New-Object System.Collections.ArrayList
+$Timeline = New-Object System.Collections.ArrayList
+$Errors   = New-Object System.Collections.ArrayList
+
+# ============================================================================
+# LOGGING
+# ============================================================================
+
+function Write-IRStep {
+    param(
+        [string]$Message
+    )
+
+    $line = "[{0}] [INFO] {1}" -f `
+        (Get-Date -Format "yyyy-MM-dd HH:mm:ss"),
+        $Message
+
+    Write-Host $line
+
+    try {
+        Add-Content `
+            -LiteralPath $LogFile `
+            -Value $line `
+            -Encoding UTF8
+    }
+    catch {}
+}
+
+function Write-IRError {
+    param(
+        [string]$Collector,
+        [string]$Message
+    )
+
+    $obj = [PSCustomObject]@{
+        Time      = Get-Date
+        Computer  = $HostName
+        Collector = $Collector
+        Error     = $Message
+    }
+
+    [void]$Errors.Add($obj)
+
+    try {
+        Add-Content `
+            -LiteralPath $LogFile `
+            -Value ("[{0}] [WARN] {1} :: {2}" -f `
+                (Get-Date -Format "yyyy-MM-dd HH:mm:ss"),
+                $Collector,
+                $Message) `
+            -Encoding UTF8
+    }
+    catch {}
+}
+
+function Add-Finding {
+    param(
+        [ValidateSet("CRITICAL","HIGH","MEDIUM","LOW")]
+        [string]$Severity,
+
+        [string]$Category,
+
+        [string]$Indicator,
+
+        [string]$Time,
+
+        [string]$Account,
+
+        [string]$Source,
+
+        [string]$Target,
+
+        [string]$Process,
+
+        [string]$CommandLine,
+
+        [string]$Evidence
+    )
+
+    $obj = [PSCustomObject]@{
+        Severity    = $Severity
+        Time        = $Time
+        Computer    = $HostName
+        Category    = $Category
+        Indicator   = $Indicator
+        Account     = $Account
+        Source      = $Source
+        Target      = $Target
+        Process     = $Process
+        CommandLine = $CommandLine
+        Evidence    = $Evidence
+    }
+
+    [void]$Findings.Add($obj)
+
+    # Console only shows findings, not every event.
+    $color = switch ($Severity) {
+        "CRITICAL" { "Magenta" }
+        "HIGH"     { "Red" }
+        "MEDIUM"   { "Yellow" }
+        default    { "Cyan" }
+    }
+
+    Write-Host `
+        ("[{0}] [{1}] [{2}] {3}" -f `
+            (Get-Date -Format "HH:mm:ss"),
+            $Severity,
+            $Category,
+            $Indicator) `
+        -ForegroundColor $color
+
+    if ($Account) {
+        Write-Host "       Account : $Account" -ForegroundColor DarkGray
+    }
+
+    if ($Source) {
+        Write-Host "       Source  : $Source" -ForegroundColor DarkGray
+    }
+
+    if ($Target) {
+        Write-Host "       Target  : $Target" -ForegroundColor DarkGray
+    }
+
+    if ($Process) {
+        Write-Host "       Process : $Process" -ForegroundColor DarkGray
+    }
+
+    if ($CommandLine) {
+        Write-Host "       Command : $CommandLine" -ForegroundColor DarkGray
+    }
+
+    if ($Evidence) {
+        Write-Host "       Evidence: $Evidence" -ForegroundColor DarkGray
+    }
+}
+
+function Add-Timeline {
+    param(
+        [datetime]$Time,
+
+        [string]$Source,
+
+        [string]$EventId,
+
+        [string]$Account,
+
+        [string]$SourceAddress,
+
+        [string]$Target,
+
+        [string]$Process,
+
+        [string]$CommandLine,
+
+        [string]$ParentProcess,
+
+        [string]$Action,
+
+        [string]$Details
+    )
+
+    $obj = [PSCustomObject]@{
+        Time          = $Time
+        Computer      = $HostName
+        Source        = $Source
+        EventId       = $EventId
+        Account       = $Account
+        SourceAddress = $SourceAddress
+        Target        = $Target
+        Process       = $Process
+        CommandLine   = $CommandLine
+        ParentProcess = $ParentProcess
+        Action        = $Action
+        Details       = $Details
+    }
+
+    [void]$Timeline.Add($obj)
+}
+
+# ============================================================================
+# SAFE EXPORT
+# ============================================================================
+
+function Save-Csv {
+    param(
+        [object]$Data,
+        [string]$Name
+    )
+
+    try {
+
+        $path = Join-Path $CaseRoot $Name
+
+        $items = @($Data)
+
+        if ($items.Count -eq 0) {
+
+            [PSCustomObject]@{
+                Status = "No records collected"
+            } |
+            Export-Csv `
+                -LiteralPath $path `
+                -NoTypeInformation `
+                -Encoding UTF8
+
+            return
+        }
+
+        $items |
+            Export-Csv `
+                -LiteralPath $path `
+                -NoTypeInformation `
+                -Encoding UTF8
+    }
+    catch {
+
+        Write-IRError `
+            "CSV:$Name" `
+            $_.Exception.Message
+    }
+}
+
+function Save-Text {
+    param(
+        [string]$Text,
+        [string]$Name
+    )
+
+    try {
+
+        Set-Content `
+            -LiteralPath (Join-Path $CaseRoot $Name) `
+            -Value $Text `
+            -Encoding UTF8
+    }
+    catch {
+
+        Write-IRError `
+            "TEXT:$Name" `
+            $_.Exception.Message
+    }
+}
+
+# ============================================================================
+# EVENT XML PARSER
+# ============================================================================
+
+function Get-EventDataHashtable {
+    param(
+        [System.Diagnostics.Eventing.Reader.EventRecord]$Event
+    )
+
+    $result = @{}
+
+    try {
+
+        [xml]$xml = $Event.ToXml()
+
+        $nodes = @(
+            $xml.Event.EventData.Data
+        )
+
+        foreach ($node in $nodes) {
+
+            if ($null -ne $node.Name) {
+
+                $name = [string]$node.Name
+                $value = [string]$node.'#text'
+
+                $result[$name] = $value
+            }
+        }
+    }
+    catch {}
+
+    return $result
+}
+
+function Get-EventValue {
+    param(
+        [hashtable]$Data,
+        [string[]]$Names
+    )
+
+    foreach ($name in $Names) {
+
+        if ($Data.ContainsKey($name)) {
+
+            if (-not [string]::IsNullOrWhiteSpace(
+                [string]$Data[$name]
+            )) {
+                return [string]$Data[$name]
+            }
+        }
+    }
+
+    return ""
+}
+
+# ============================================================================
+# PIVOT TESTING
+# ============================================================================
+
+function Test-Pivot {
+    param(
+        [string]$Text
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return @()
+    }
+
+    $matched = New-Object System.Collections.ArrayList
+
+    foreach ($user in $PivotUsers) {
+
+        if ([string]::IsNullOrWhiteSpace($user)) {
+            continue
+        }
+
+        try {
+
+            if ($Text -match "(?i)\b$([regex]::Escape($user))\b") {
+                [void]$matched.Add($user)
+            }
+        }
+        catch {}
+    }
+
+    return @($matched)
+}
+
+function Is-SuspiciousCommand {
+    param(
+        [string]$Command
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Command)) {
+        return $false
+    }
+
+    return (
+        $Command -match "(?i)\bmanage-bde(?:\.exe)?\b" -or
+        $Command -match "(?i)\b(powershell|pwsh)\b" -or
+        $Command -match "(?i)\b(mshta|wscript|cscript|rundll32|regsvr32|certutil|bitsadmin)\b" -or
+        $Command -match "(?i)(EncodedCommand|FromBase64String|DownloadString|Invoke-WebRequest|Invoke-RestMethod)" -or
+        $Command -match "(?i)\b(schtasks|sc\.exe|wmic|winrs|psexec)\b" -or
+        $Command -match "(?i)\b(net\s+use|net\s+user|net\s+localgroup)\b"
+    )
+}
+
+function Is-BitLockerCommand {
+    param(
+        [string]$Text
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $false
+    }
+
+    return (
+        $Text -match "(?i)\bmanage-bde(?:\.exe)?\b" -or
+        $Text -match "(?i)\b(BitLocker|BitLockerVolume)\b" -or
+        $Text -match "(?i)\bEnable-BitLocker\b" -or
+        $Text -match "(?i)\bAdd-BitLockerKeyProtector\b" -or
+        $Text -match "(?i)\bResume-BitLocker\b" -or
+        $Text -match "(?i)\bBackup-BitLockerKeyProtector\b"
+    )
+}
+
+# ============================================================================
+# HEADER
+# ============================================================================
+
+Write-IRStep "============================================================"
+Write-IRStep "WINDOWS INCIDENT RESPONSE COLLECTION"
+Write-IRStep "============================================================"
+Write-IRStep "Host: $HostName"
+Write-IRStep "Primary suspect: $SuspectUser"
+Write-IRStep "Pivot accounts: $($PivotUsers -join ', ')"
+Write-IRStep "Incident start: $StartIST"
+Write-IRStep "Incident end:   $EndIST"
+Write-IRStep "Case: $CaseRoot"
+Write-IRStep "Mode: READ ONLY"
+Write-IRStep "============================================================"
+
+# ============================================================================
+# 01 SYSTEM BASELINE
+# ============================================================================
+
+Write-IRStep "01/20 Collecting operating system and host baseline"
+
+try {
+
+    $os = Get-CimInstance Win32_OperatingSystem
+    $cs = Get-CimInstance Win32_ComputerSystem
+
+    Save-Csv `
+        @(
+            [PSCustomObject]@{
+                ComputerName = $HostName
+                Domain       = $cs.Domain
+                Manufacturer = $cs.Manufacturer
+                Model        = $cs.Model
+                OS           = $os.Caption
+                Version      = $os.Version
+                Build        = $os.BuildNumber
+                Architecture = $os.OSArchitecture
+                InstallDate  = $os.InstallDate
+                LastBoot     = $os.LastBootUpTime
+                PowerShell   = $PSVersionTable.PSVersion.ToString()
+                Collection   = Get-Date
+            }
+        ) `
+        "SYSTEM.csv"
+}
+catch {
+    Write-IRError "SystemBaseline" $_.Exception.Message
+}
+
+# ============================================================================
+# 02 LOCAL USERS / GROUPS
+# ============================================================================
+
+Write-IRStep "02/20 Collecting local users and privileged local groups"
+
+try {
+
+    $localUsers = @(
+        Get-CimInstance Win32_UserAccount |
+        Select-Object `
+            Name,
+            Domain,
+            SID,
+            Disabled,
+            Lockout,
+            LocalAccount
+    )
+
+    Save-Csv `
+        $localUsers `
+        "LOCAL_USERS.csv"
+}
+catch {
+    Write-IRError "LocalUsers" $_.Exception.Message
+}
+
+try {
+
+    $adminMembers = @()
+
+    $group = [ADSI]"WinNT://$HostName/Administrators,group"
+
+    foreach ($member in @($group.psbase.Invoke("Members"))) {
+
+        $name = ""
+        $domain = ""
+
+        try {
+            $name = $member.GetType().InvokeMember(
+                "Name",
+                "GetProperty",
+                $null,
+                $member,
+                $null
+            )
+        }
+        catch {}
+
+        try {
+            $domain = $member.GetType().InvokeMember(
+                "Domain",
+                "GetProperty",
+                $null,
+                $member,
+                $null
+            )
+        }
+        catch {}
+
+        $adminMembers += [PSCustomObject]@{
+            Domain = $domain
+            Name   = $name
+        }
+
+        if ($name -ieq $SuspectUser -or
+            $name -ieq "sysadmin") {
+
+            Add-Finding `
+                -Severity "HIGH" `
+                -Category "PRIVILEGE" `
+                -Indicator "Investigation account is local administrator" `
+                -Time (Get-Date).ToString("o") `
+                -Account "$domain\$name" `
+                -Source "" `
+                -Target $HostName `
+                -Process "" `
+                -CommandLine "" `
+                -Evidence "Local Administrators group"
+        }
+    }
+
+    Save-Csv `
+        $adminMembers `
+        "LOCAL_ADMINISTRATORS.csv"
+}
+catch {
+    Write-IRError "LocalAdministrators" $_.Exception.Message
+}
+
+# ============================================================================
+# 03 AD USER INVENTORY
+# ============================================================================
+
+Write-IRStep "03/20 Collecting Active Directory user inventory"
+
+try {
+
+    Import-Module ActiveDirectory -ErrorAction Stop
+
+    $adUsers = @(
+        Get-ADUser `
+            -Filter * `
+            -Properties `
+                Enabled,
+                LastLogonDate,
+                PasswordLastSet,
+                PasswordNeverExpires,
+                AdminCount,
+                LockedOut,
+                DistinguishedName,
+                MemberOf,
+                WhenCreated,
+                WhenChanged |
+        Select-Object `
+            SamAccountName,
+            UserPrincipalName,
+            Enabled,
+            LockedOut,
+            AdminCount,
+            LastLogonDate,
+            PasswordLastSet,
+            PasswordNeverExpires,
+            WhenCreated,
+            WhenChanged,
+            DistinguishedName,
+            @{N="MemberOf";E={
+                if ($_.MemberOf) {
+                    ($_.MemberOf -join " | ")
+                }
+                else {
+                    ""
+                }
+            }}
+    )
+
+    Save-Csv `
+        $adUsers `
+        "AD_USERS.csv"
+
+    foreach ($adUser in $adUsers) {
+
+        if ($adUser.SamAccountName -ieq $SuspectUser -or
+            $adUser.SamAccountName -ieq "sysadmin") {
+
+            Add-Finding `
+                -Severity "HIGH" `
+                -Category "AD_IDENTITY" `
+                -Indicator "Incident pivot account present in AD" `
+                -Time $adUser.WhenChanged.ToString("o") `
+                -Account $adUser.SamAccountName `
+                -Source "" `
+                -Target $HostName `
+                -Process "" `
+                -CommandLine "" `
+                -Evidence "Enabled=$($adUser.Enabled); AdminCount=$($adUser.AdminCount); LastLogon=$($adUser.LastLogonDate)"
+        }
+    }
+}
+catch {
+    Write-IRError `
+        "ActiveDirectoryInventory" `
+        "AD module unavailable or query failed: $($_.Exception.Message)"
+}
+
+# ============================================================================
+# 04 LIVE PROCESSES
+# ============================================================================
+
+Write-IRStep "04/20 Collecting current processes and command lines"
+
+try {
+
+    $processes = @()
+
+    foreach ($proc in @(Get-CimInstance Win32_Process)) {
+
+        $owner = ""
+        $ownerDomain = ""
+
+        try {
+
+            $ownerResult = Invoke-CimMethod `
+                -InputObject $proc `
+                -MethodName GetOwner
+
+            if ($ownerResult.ReturnValue -eq 0) {
+
+                $owner = [string]$ownerResult.User
+                $ownerDomain = [string]$ownerResult.Domain
+            }
+        }
+        catch {}
+
+        $identity = ""
+
+        if ($owner) {
+            $identity = "$ownerDomain\$owner"
+        }
+
+        $record = [PSCustomObject]@{
+            Name            = $proc.Name
+            ProcessId       = $proc.ProcessId
+            ParentProcessId = $proc.ParentProcessId
+            ExecutablePath  = $proc.ExecutablePath
+            CommandLine     = $proc.CommandLine
+            Owner           = $identi
